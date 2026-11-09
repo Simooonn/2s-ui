@@ -73,6 +73,9 @@ var (
 // CanSelfUpdate reports whether an in-panel update can run here, and if not, a
 // short human-readable reason for the UI.
 func (s *UpdateService) CanSelfUpdate() (bool, string) {
+	if os.Getenv("S_UI_DISABLE_SELF_UPDATE") == "1" {
+		return false, "self-update disabled; use the managed image upgrade process"
+	}
 	if runtime.GOOS != "linux" {
 		return false, "self-update is only supported on Linux"
 	}

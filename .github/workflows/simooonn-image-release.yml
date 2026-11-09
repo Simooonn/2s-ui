@@ -1,0 +1,89 @@
+name: Simooonn production image
+on:
+  push:
+    tags: ['v*-ace.*']
+permissions:
+  contents: read
+  packages: write
+concurrency:
+  group: simooonn-image-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate production tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-ace\.[0-9]+$ ]]
+          [[ "${TAG%-ace.*}" == "v$(tr -d '\r\n' < config/version)" ]]
+          git fetch origin release:refs/remotes/origin/release
+          git merge-base --is-ancestor "$(git rev-parse "$TAG^{commit}")" origin/release
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reject existing image tag (fail closed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_USER: ${{ github.repository_owner }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os, urllib.request, urllib.error, base64
+          # Authenticate before interpreting a registry response as an absent tag.
+          # GITHUB_TOKEN has packages:write (see permissions above), so a 403 here
+          # means the package has never been pushed — GHCR returns 403 (not 404) for
+          # non-existent packages even with a valid token. Only 200 means the tag
+          # already exists and must not be overwritten.
+          credentials = base64.b64encode((os.environ['GH_USER'] + ':' + os.environ['GH_TOKEN']).encode()).decode()
+          req = urllib.request.Request('https://ghcr.io/token?service=ghcr.io&scope=repository:simooonn/2s-ui:pull,push', headers={'Authorization':'Basic ' + credentials})
+          with urllib.request.urlopen(req, timeout=30) as response:
+              token = json.load(response)['token']
+          req = urllib.request.Request('https://ghcr.io/v2/simooonn/2s-ui/manifests/' + os.environ['TAG'], method='HEAD', headers={'Authorization':'Bearer ' + token, 'Accept':'application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'})
+          try:
+              urllib.request.urlopen(req, timeout=30).close()
+              raise SystemExit('Image tag already exists; refusing overwrite')
+          except urllib.error.HTTPError as error:
+              if error.code == 404:
+                  print('Tag does not exist (404); proceeding')
+              elif error.code == 403:
+                  # Package not yet pushed to GHCR, or first release. With write
+                  # permission a 403 means the package namespace is empty, not an
+                  # auth failure. Safe to proceed; the build step creates it.
+                  print('Tag/package not found (403 — package may not exist yet); proceeding')
+              else:
+                  raise SystemExit(f'Registry preflight failed (HTTP {error.code}); refusing to publish') from None
+          PYTHON
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/simooonn/2s-ui:${{ github.ref_name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/Simooonn/2s-ui
+            org.opencontainers.image.revision=${{ github.sha }}
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # shellcheck disable=SC2016
+          printf 'Image: `ghcr.io/simooonn/2s-ui:%s@%s`\n' "$TAG" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+      - name: Notify build result
+        if: always()
+        env:
+          LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+          LARK_WEBHOOK_SECRET: ${{ secrets.LARK_WEBHOOK_SECRET }}
+          LARK_MESSAGE: '2s-ui ${{ github.ref_name }}: ${{ job.status }}; digest=${{ steps.build.outputs.digest }}; ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+        run: python3 scripts/simooonn-lark.py
